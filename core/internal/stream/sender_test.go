@@ -1,0 +1,574 @@
+package stream_test
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/Khan/genqlient/graphql"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	"github.com/wandb/wandb/core/internal/featurechecker"
+	"github.com/wandb/wandb/core/internal/filestream"
+	"github.com/wandb/wandb/core/internal/filestreamstats"
+	"github.com/wandb/wandb/core/internal/filestreamtest"
+	"github.com/wandb/wandb/core/internal/filetransfer"
+	"github.com/wandb/wandb/core/internal/gqlmock"
+	"github.com/wandb/wandb/core/internal/mailbox"
+	"github.com/wandb/wandb/core/internal/observability"
+	"github.com/wandb/wandb/core/internal/observabilitytest"
+	"github.com/wandb/wandb/core/internal/runfiles"
+	"github.com/wandb/wandb/core/internal/runhandle"
+	"github.com/wandb/wandb/core/internal/runsummary"
+	"github.com/wandb/wandb/core/internal/runupserter"
+	"github.com/wandb/wandb/core/internal/runupsertertest"
+	"github.com/wandb/wandb/core/internal/runworktest"
+	wbsettings "github.com/wandb/wandb/core/internal/settings"
+	"github.com/wandb/wandb/core/internal/stream"
+	"github.com/wandb/wandb/core/internal/watchertest"
+	"github.com/wandb/wandb/core/pkg/artifacts"
+	spb "github.com/wandb/wandb/core/pkg/service_go_proto"
+)
+
+const validLinkArtifactResponse = `{
+	"linkArtifact": { "versionIndex": 0 }
+}`
+
+type testFixtures struct {
+	Sender    *stream.Sender
+	RunHandle *runhandle.RunHandle
+	Settings  *wbsettings.Settings
+	Logger    *observability.CoreLogger
+	Logs      *bytes.Buffer
+}
+
+func makeSender(t *testing.T, client graphql.Client) testFixtures {
+	return makeSenderWithFileStream(t, client, nil)
+}
+
+func makeSenderWithFileStream(
+	t *testing.T,
+	client graphql.Client,
+	fileStream filestream.FileStream,
+	stats ...*filestreamstats.Stats,
+) testFixtures {
+	t.Helper()
+	runWork := runworktest.New()
+	logger, logs := observabilitytest.NewRecordingTestLogger(t)
+	settings := wbsettings.From(&spb.Settings{
+		RunId:    &wrapperspb.StringValue{Value: "run1"},
+		Console:  &wrapperspb.StringValue{Value: "off"},
+		ApiKey:   &wrapperspb.StringValue{Value: "test-api-key"},
+		SyncDir:  wrapperspb.String(t.TempDir()),
+		XPrimary: wrapperspb.Bool(true),
+	})
+	baseURL := stream.BaseURLFromSettings(logger, settings)
+	credentialProvider := stream.CredentialsFromSettings(logger, settings)
+	fileStreamFactory := &filestream.FileStreamFactory{
+		FeatureProvider: featurechecker.New(nil, logger),
+		Logger:          logger,
+		Printer:         observability.NewPrinter(0),
+		Settings:        settings,
+	}
+	fileTransferManager := stream.NewFileTransferManager(
+		baseURL,
+		filetransfer.NewFileTransferStats(),
+		logger,
+		settings,
+	)
+	runHandle := runhandle.New()
+	fileWatcher := watchertest.NewFakeWatcher()
+	runfilesUploaderFactory := &runfiles.UploaderFactory{
+		FileTransfer: fileTransferManager,
+		FileWatcher:  fileWatcher,
+		GraphQL:      client,
+		Logger:       logger,
+		Settings:     settings,
+		RunHandle:    runHandle,
+	}
+	if fileStream != nil {
+		upserter := runupsertertest.NewTestUpserter(
+			t,
+			"test-entity",
+			"test-project",
+			"run1",
+			runupserter.RunUpserterParams{Settings: settings},
+		)
+		assert.NoError(t, runHandle.Init(upserter))
+	}
+
+	senderFactory := stream.SenderFactory{
+		BaseURL:                 baseURL,
+		CredentialProvider:      credentialProvider,
+		Logger:                  logger,
+		Printer:                 observability.NewPrinter(0),
+		Settings:                settings,
+		FileStreamFactory:       fileStreamFactory,
+		FileTransferManager:     fileTransferManager,
+		FileTransferStats:       filetransfer.NewFileTransferStats(),
+		FileWatcher:             fileWatcher,
+		RunfilesUploaderFactory: runfilesUploaderFactory,
+		Mailbox:                 mailbox.New(),
+		GraphqlClient:           client,
+		Peeker:                  &observability.Peeker{},
+		FeatureProvider:         featurechecker.New(nil, logger),
+		RunHandle:               runHandle,
+		HistoryStepTracker:      stream.NewHistoryStepTracker(logger, runHandle),
+	}
+	if len(stats) > 0 {
+		senderFactory.Stats = stats[0]
+	}
+	var sender *stream.Sender
+	if fileStream != nil {
+		sender = senderFactory.NewWithFileStream(runWork, fileStream)
+	} else {
+		sender = senderFactory.New(runWork)
+	}
+	return testFixtures{
+		Sender:    sender,
+		RunHandle: runHandle,
+		Settings:  settings,
+		Logger:    logger,
+		Logs:      logs,
+	}
+}
+
+func TestSendExitBeforeRunInitialization(t *testing.T) {
+	client := gqlmock.NewMockClient()
+	x := makeSender(t, client)
+	require.NoError(t, os.MkdirAll(x.Settings.GetFilesDir(), 0o700))
+	request, responses := runworktest.SimpleRequest(t, "exit")
+	x.Sender.SendRecord(&spb.Record{
+		RecordType: &spb.Record_Exit{Exit: &spb.RunExitRecord{}},
+	}, request)
+
+	select {
+	case response := <-responses:
+		require.NotNil(t, response.GetResultCommunicate().GetExitResult())
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown did not finish")
+	}
+
+	assert.Empty(t, client.AllRequests())
+	files, err := os.ReadDir(x.Settings.GetFilesDir())
+	require.NoError(t, err)
+	assert.Empty(t, files)
+	for _, entry := range observabilitytest.ExtractLogs(t, x.Logs) {
+		assert.NotEqual(t, "ERROR", entry["level"], entry["msg"])
+	}
+}
+
+func TestSendSummaryIgnoresInboundStep(t *testing.T) {
+	fileStream := filestreamtest.NewFakeFileStream()
+	x := makeSenderWithFileStream(t, gqlmock.NewMockClient(), fileStream)
+
+	x.Sender.SendRecord(&spb.Record{
+		RecordType: &spb.Record_History{
+			History: &spb.HistoryRecord{
+				Item: []*spb.HistoryItem{
+					{NestedKey: []string{"loss"}, ValueJson: "1.23"},
+				},
+			},
+		},
+	}, nil)
+	x.Sender.SendRecord(&spb.Record{
+		RecordType: &spb.Record_Summary{
+			Summary: &spb.SummaryRecord{
+				Update: []*spb.SummaryItem{
+					{Key: "loss", ValueJson: "1.23"},
+					{Key: "_step", ValueJson: "999"},
+				},
+			},
+		},
+	}, nil)
+
+	request := fileStream.GetRequest(x.Settings)
+
+	summary := runsummary.New()
+	require.NoError(t, request.SummaryUpdates.Apply(summary))
+	summaryMap := summary.ToNestedMaps()
+	assert.Equal(t, map[string]any{"loss": 1.23, "_step": int64(0)}, summaryMap)
+}
+
+func TestSendHistoryAppliesSteps(t *testing.T) {
+	fileStream := filestreamtest.NewFakeFileStream()
+	x := makeSenderWithFileStream(t, gqlmock.NewMockClient(), fileStream)
+
+	x.Sender.SendRecord(&spb.Record{
+		RecordType: &spb.Record_History{History: &spb.HistoryRecord{
+			Item: []*spb.HistoryItem{
+				{NestedKey: []string{"loss"}, ValueJson: "1.23"},
+			},
+		}},
+	}, nil)
+
+	request := fileStream.GetRequest(x.Settings)
+	require.Len(t, request.HistoryLines, 1)
+	assert.JSONEq(t, `{"loss": 1.23, "_step": 0}`, request.HistoryLines[0])
+}
+
+func sendHistoryItems(x testFixtures, items ...*spb.HistoryItem) {
+	x.Sender.SendRecord(&spb.Record{
+		RecordType: &spb.Record_History{History: &spb.HistoryRecord{Item: items}},
+	}, nil)
+}
+
+func TestSendHistoryUploadsTypedValuesAndPaths(t *testing.T) {
+	fileStream := filestreamtest.NewFakeFileStream()
+	x := makeSenderWithFileStream(t, gqlmock.NewMockClient(), fileStream)
+
+	sendHistoryItems(x,
+		&spb.HistoryItem{Key: "null", Value: &spb.HistoryItem_None{}},
+		&spb.HistoryItem{
+			Key:   "false",
+			Value: &spb.HistoryItem_Boolean{Boolean: false},
+		},
+		&spb.HistoryItem{
+			Key:   "zero",
+			Value: &spb.HistoryItem_Integer{Integer: 0},
+		},
+		&spb.HistoryItem{
+			Key:   "float",
+			Value: &spb.HistoryItem_Number{Number: 1.0},
+		},
+		&spb.HistoryItem{
+			Key:   "empty",
+			Value: &spb.HistoryItem_Text{Text: ""},
+		},
+		&spb.HistoryItem{
+			NestedKey: []string{"nested", "object"},
+			Value:     &spb.HistoryItem_Json{Json: `{"a": 1, "b": {"c": true}}`},
+		},
+		&spb.HistoryItem{
+			NestedKey: []string{"nested", "array"},
+			Value:     &spb.HistoryItem_Json{Json: `[1, {"x": null}]`},
+		},
+	)
+
+	rows := fileStream.GetRequest(x.Settings).HistoryLines
+	require.Len(t, rows, 1)
+	assert.JSONEq(t, `{
+		"_step": 0,
+		"null":  null,
+		"false": false,
+		"zero":  0,
+		"float": 1,
+		"empty": "",
+		"nested": {
+			"object": {	"a": 1, "b": {"c": true}},
+			"array": [1, {"x": null}]
+		}
+	}`, rows[0])
+}
+
+func TestSendHistoryPrefersTypedValues(t *testing.T) {
+	fileStream := filestreamtest.NewFakeFileStream()
+	x := makeSenderWithFileStream(t, gqlmock.NewMockClient(), fileStream)
+
+	sendHistoryItems(x,
+		&spb.HistoryItem{
+			Key:       "typed",
+			Value:     &spb.HistoryItem_Integer{Integer: 7},
+			ValueJson: "99",
+		},
+		&spb.HistoryItem{Key: "legacy", ValueJson: `{"a": [false, 2]}`},
+	)
+
+	rows := fileStream.GetRequest(x.Settings).HistoryLines
+	require.Len(t, rows, 1)
+	assert.JSONEq(t, `{
+		"typed":  7,
+		"legacy": {"a": [false, 2]},
+		"_step":  0
+	}`, rows[0])
+}
+
+func TestSendHistoryPreservesTypedStep(t *testing.T) {
+	fileStream := filestreamtest.NewFakeFileStream()
+	x := makeSenderWithFileStream(t, gqlmock.NewMockClient(), fileStream)
+
+	sendHistoryItems(x,
+		&spb.HistoryItem{Key: "_step", Value: &spb.HistoryItem_Integer{Integer: 5}},
+		&spb.HistoryItem{Key: "first", Value: &spb.HistoryItem_Boolean{Boolean: true}},
+	)
+	sendHistoryItems(x,
+		&spb.HistoryItem{Key: "second", Value: &spb.HistoryItem_Integer{Integer: 2}},
+	)
+
+	rows := fileStream.GetRequest(x.Settings).HistoryLines
+	require.Len(t, rows, 2)
+	assert.JSONEq(t, `{	"_step": 5, "first": true}`, rows[0])
+	assert.JSONEq(t, `{	"_step": 6, "second": 2}`, rows[1])
+}
+
+// Verify that arguments are properly passed through to graphql
+func TestSendLinkArtifact(t *testing.T) {
+	mockGQL := gqlmock.NewMockClient()
+	x := makeSender(t, mockGQL)
+
+	// 1. When both clientId and serverId are sent, serverId is used
+	linkArtifact := &spb.Record{
+		RecordType: &spb.Record_Request{
+			Request: &spb.Request{
+				RequestType: &spb.Request_LinkArtifact{
+					LinkArtifact: &spb.LinkArtifactRequest{
+						ClientId:         "clientId",
+						ServerId:         "serverId",
+						PortfolioName:    "portfolioName",
+						PortfolioEntity:  "portfolioEntity",
+						PortfolioProject: "portfolioProject",
+					},
+				},
+			},
+		},
+		Control: &spb.Control{
+			MailboxSlot: "junk",
+		},
+	}
+
+	mockGQL.StubMatchOnce(
+		gqlmock.WithOpName("LinkArtifact"),
+		validLinkArtifactResponse,
+	)
+	request, outputs := runworktest.SimpleRequest(t, "test-id")
+	x.Sender.SendRecord(linkArtifact, request)
+	<-outputs
+
+	requests := mockGQL.AllRequests()
+	assert.Len(t, requests, 1)
+	gqlmock.AssertVariables(t,
+		requests[0],
+		gqlmock.GQLVar("projectName", gomock.Eq("portfolioProject")),
+		gqlmock.GQLVar("entityName", gomock.Eq("portfolioEntity")),
+		gqlmock.GQLVar("artifactPortfolioName", gomock.Eq("portfolioName")),
+		gqlmock.GQLVar("clientId", gomock.Eq(nil)),
+		gqlmock.GQLVar("artifactId", gomock.Eq("serverId")))
+
+	// 2. When only clientId is sent, clientId is used
+	linkArtifact = &spb.Record{
+		RecordType: &spb.Record_Request{
+			Request: &spb.Request{
+				RequestType: &spb.Request_LinkArtifact{
+					LinkArtifact: &spb.LinkArtifactRequest{
+						ClientId:         "clientId",
+						ServerId:         "",
+						PortfolioName:    "portfolioName",
+						PortfolioEntity:  "portfolioEntity",
+						PortfolioProject: "portfolioProject",
+					},
+				},
+			},
+		},
+	}
+
+	mockGQL.StubMatchOnce(
+		gqlmock.WithOpName("LinkArtifact"),
+		validLinkArtifactResponse,
+	)
+	request, outputs = runworktest.SimpleRequest(t, "test-id")
+	x.Sender.SendRecord(linkArtifact, request)
+	<-outputs
+
+	requests = mockGQL.AllRequests()
+	assert.Len(t, requests, 2)
+	gqlmock.AssertVariables(t,
+		requests[1],
+		gqlmock.GQLVar("projectName", gomock.Eq("portfolioProject")),
+		gqlmock.GQLVar("entityName", gomock.Eq("portfolioEntity")),
+		gqlmock.GQLVar("artifactPortfolioName", gomock.Eq("portfolioName")),
+		gqlmock.GQLVar("clientId", gomock.Eq("clientId")),
+		gqlmock.GQLVar("artifactId", gomock.Eq(nil)))
+
+	// 3. When only serverId is sent, serverId is used
+	linkArtifact = &spb.Record{
+		RecordType: &spb.Record_Request{
+			Request: &spb.Request{
+				RequestType: &spb.Request_LinkArtifact{
+					LinkArtifact: &spb.LinkArtifactRequest{
+						ClientId:         "",
+						ServerId:         "serverId",
+						PortfolioName:    "portfolioName",
+						PortfolioEntity:  "portfolioEntity",
+						PortfolioProject: "portfolioProject",
+					},
+				},
+			},
+		},
+	}
+
+	mockGQL.StubMatchOnce(
+		gqlmock.WithOpName("LinkArtifact"),
+		validLinkArtifactResponse,
+	)
+	request, outputs = runworktest.SimpleRequest(t, "test-id")
+	x.Sender.SendRecord(linkArtifact, request)
+	<-outputs
+
+	requests = mockGQL.AllRequests()
+	assert.Len(t, requests, 3)
+	gqlmock.AssertVariables(t,
+		requests[2],
+		gqlmock.GQLVar("projectName", gomock.Eq("portfolioProject")),
+		gqlmock.GQLVar("entityName", gomock.Eq("portfolioEntity")),
+		gqlmock.GQLVar("artifactPortfolioName", gomock.Eq("portfolioName")),
+		gqlmock.GQLVar("clientId", gomock.Eq(nil)),
+		gqlmock.GQLVar("artifactId", gomock.Eq("serverId")))
+}
+
+func TestSendUseArtifact(t *testing.T) {
+	mockGQL := gqlmock.NewMockClient()
+	x := makeSender(t, mockGQL)
+
+	useArtifact := &spb.Record{
+		RecordType: &spb.Record_UseArtifact{
+			UseArtifact: &spb.UseArtifactRecord{
+				Id:      "artifactId",
+				Type:    "job",
+				Name:    "artifactName",
+				Partial: nil,
+			},
+		},
+	}
+	// verify doesn't panic if used job artifact
+	x.Sender.SendRecord(useArtifact, nil)
+
+	// verify doesn't panic if partial job is broken
+	useArtifact = &spb.Record{
+		RecordType: &spb.Record_UseArtifact{
+			UseArtifact: &spb.UseArtifactRecord{
+				Id:   "artifactId",
+				Type: "job",
+				Name: "artifactName",
+				Partial: &spb.PartialJobArtifact{
+					JobName: "jobName",
+					SourceInfo: &spb.JobSource{
+						SourceType: "repo",
+						Source: &spb.Source{
+							Git: &spb.GitSource{
+								GitInfo: &spb.GitInfo{
+									Commit: "commit",
+									Remote: "remote",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	x.Sender.SendRecord(useArtifact, nil)
+}
+
+var validFetchOrgEntityFromEntityResponse = `{
+	"entity": {
+		"organization": {
+			"name": "orgName",
+			"orgEntity": {
+				"name": "orgEntityName_123"
+			}
+		}
+	}
+}`
+
+func TestLinkRegistryArtifact(t *testing.T) {
+	registryProject := artifacts.RegistryProjectPrefix + "projectName"
+	expectLinkArtifactFailure := "expect link artifact to fail, wrong org entity"
+
+	testCases := []struct {
+		name              string
+		inputOrganization string
+		errorMessage      string
+	}{
+		{"Link registry artifact with orgName", "orgName", ""},
+		{
+			"Link registry artifact with orgEntity name",
+			"orgEntityName_123",
+			"",
+		},
+		{"Link registry artifact with short hand path", "", ""},
+		{
+			"Link with wrong org/orgEntity name",
+			"potato",
+			"update the target path",
+		},
+	}
+	for _, tc := range testCases {
+		mockGQL := gqlmock.NewMockClient()
+
+		newLinker := func(req *spb.LinkArtifactRequest) *artifacts.ArtifactLinker {
+			return &artifacts.ArtifactLinker{
+				Ctx:           context.Background(),
+				LinkArtifact:  req,
+				GraphqlClient: mockGQL,
+			}
+		}
+
+		t.Run("Link registry artifact with orgName", func(t *testing.T) {
+			req := &spb.LinkArtifactRequest{
+				ClientId:              "clientId123",
+				PortfolioName:         "portfolioName",
+				PortfolioEntity:       "entityName",
+				PortfolioProject:      registryProject,
+				PortfolioAliases:      nil,
+				PortfolioOrganization: tc.inputOrganization,
+			}
+
+			mockGQL.StubMatchOnce(
+				gqlmock.WithOpName("LinkArtifact"),
+				validLinkArtifactResponse,
+			)
+
+			mockGQL.StubMatchOnce(
+				gqlmock.WithOpName("FetchOrgEntityFromEntity"),
+				validFetchOrgEntityFromEntityResponse,
+			)
+
+			linker := newLinker(req)
+			_, err := linker.Link()
+			if err != nil {
+				assert.NotEmpty(t, tc.errorMessage)
+				assert.ErrorContainsf(t, err, tc.errorMessage,
+					"Expected error containing: %s", tc.errorMessage)
+				return
+			}
+
+			// This error is not triggered by Link() because its linkArtifact that fails
+			// and we aren't actually calling it.
+			// Here we are checking that the org entity being passed into linkArtifact
+			// is wrong so we know the query will fail.
+			if tc.errorMessage == expectLinkArtifactFailure {
+				requests := mockGQL.AllRequests()
+				assert.Len(t, requests, 2)
+
+				// Confirms that the request is incorrectly put into link artifact graphql request
+				gqlmock.AssertVariables(t,
+					requests[1],
+					gqlmock.GQLVar("projectName", gomock.Eq(registryProject)),
+					// Here the entity name is not orgEntityName_123 and this will fail if actually called
+					gqlmock.GQLVar("entityName", gomock.Not(gomock.Eq("orgEntityName_123"))),
+					gqlmock.GQLVar("artifactPortfolioName", gomock.Eq("portfolioName")),
+					gqlmock.GQLVar("clientId", gomock.Eq("clientId123")),
+					gqlmock.GQLVar("artifactId", gomock.Nil()))
+			} else {
+				// If no error, check that we are passing in the correct org entity name into linkArtifact
+				assert.Empty(t, tc.errorMessage)
+				assert.NoError(t, err)
+				requests := mockGQL.AllRequests()
+				assert.Len(t, requests, 2)
+
+				gqlmock.AssertVariables(t,
+					requests[1],
+					gqlmock.GQLVar("projectName", gomock.Eq(registryProject)),
+					gqlmock.GQLVar("entityName", gomock.Eq("orgEntityName_123")),
+					gqlmock.GQLVar("artifactPortfolioName", gomock.Eq("portfolioName")),
+					gqlmock.GQLVar("clientId", gomock.Eq("clientId123")),
+					gqlmock.GQLVar("artifactId", gomock.Nil()))
+			}
+		})
+	}
+}

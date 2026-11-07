@@ -1,0 +1,956 @@
+// ntcharts - Copyright (c) 2024 Neomantra Corp.
+
+// Package linechart implements a canvas that displays
+// (X,Y) Cartesian coordinates as a line chart.
+package linechart
+
+import (
+	"fmt"
+	"math"
+
+	"github.com/NimbleMarkets/ntcharts/v2/canvas"
+	"github.com/NimbleMarkets/ntcharts/v2/canvas/graph"
+	"github.com/NimbleMarkets/ntcharts/v2/canvas/runes"
+
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	zone "github.com/lrstanley/bubblezone/v2"
+)
+
+var defaultStyle = lipgloss.NewStyle()
+
+// LabelFormatter converts a float64 into text
+// for displaying the X and Y axis labels
+// given an index of label and numeric value
+// Index increments from minimum value to maximum values.
+type LabelFormatter func(int, float64) string
+
+// DefaultLabelFormatter returns a LabelFormatter
+// that convert float64 to integers.
+// Values that round to zero are always labeled "0", never "-0".
+func DefaultLabelFormatter() LabelFormatter {
+	return func(i int, v float64) string {
+		s := fmt.Sprintf("%.0f", v)
+		if s == "-0" {
+			return "0"
+		}
+		return s
+	}
+}
+
+// Model contains state of a linechart with an embedded canvas.Model
+type Model struct {
+	UpdateHandler   UpdateHandler
+	Canvas          canvas.Model
+	Style           lipgloss.Style // style applied when drawing runes
+	AxisStyle       lipgloss.Style // style applied when drawing X and Y axes
+	LabelStyle      lipgloss.Style // style applied when drawing X and Y number value
+	XLabelFormatter LabelFormatter // convert to X number values display string
+	YLabelFormatter LabelFormatter // convert to Y number values display string
+	xStep           int            // number of steps when displaying X axis values
+	yStep           int            // number of steps when displaying Y axis values
+	xScale          Scale          // how X values are spaced along the X axis
+	yScale          Scale          // how Y values are spaced along the Y axis
+	focus           bool
+
+	// the expected min and max values
+	minX float64
+	maxX float64
+	minY float64
+	maxY float64
+
+	// current min and max axes values to display
+	viewMinX float64
+	viewMaxX float64
+	viewMinY float64
+	viewMaxY float64
+
+	// whether to automatically set expected values
+	// when a value appears beyond the existing bounds
+	AutoMinX bool
+	AutoMaxX bool
+	AutoMinY bool
+	AutoMaxY bool
+
+	origin      canvas.Point // start of X and Y axes lines on canvas for graphing area
+	graphWidth  int          // width of graphing area - excludes X axis and labels
+	graphHeight int          // height of graphing area - excludes Y axis and labels
+
+	MaxInterpolationPoints int   // maximum points to interpolate for lines/circles
+	y2                     *Axis // right Y axis; nil when there is none. Never written through: Model copies share it.
+
+	zoneManager *zone.Manager // provides mouse functionality
+	zoneID      string
+}
+
+// New returns a linechart Model initialized with given width, height,
+// expected data value ranges and various options.
+// Width and height includes area used for chart labeling.
+// If xStep is 0, then will not draw X axis or values below X axis.
+// If yStep is 0, then will not draw Y axis or values left of Y axis.
+func New(w, h int, minX, maxX, minY, maxY float64, opts ...Option) Model {
+	m := Model{
+		UpdateHandler:   XYAxesUpdateHandler(1, 1),
+		Canvas:          canvas.New(w, h),
+		Style:           defaultStyle,
+		AxisStyle:       defaultStyle,
+		LabelStyle:      defaultStyle,
+		XLabelFormatter: DefaultLabelFormatter(),
+		YLabelFormatter: DefaultLabelFormatter(),
+		yStep:           2,
+		xStep:           2,
+		minX:            minX,
+		maxX:            maxX,
+		minY:            minY,
+		maxY:            maxY,
+		viewMinX:        minX,
+		viewMaxX:        maxX,
+		viewMinY:        minY,
+		viewMaxY:        maxY,
+	}
+	for _, opt := range opts {
+		opt(&m)
+	}
+	m.UpdateGraphSizes()
+	return m
+}
+
+// getGraphSizeAndOrigin calculates and returns the linechart origin and graph width and height
+func getGraphSizeAndOrigin(w, h int, minY, maxY float64, xStep, yStep int, yScale Scale, yFmter LabelFormatter) (canvas.Point, int, int) {
+	// graph width and height exclude area used by axes
+	// origin point is canvas coordinates of where axes are drawn
+	origin := canvas.Point{X: 0, Y: h - 1}
+	gWidth := w
+	gHeight := h
+	if xStep > 0 {
+		// use last 2 rows of canvas to plot X axis and tick values
+		origin.Y -= 1
+		gHeight -= 2
+	}
+	if yStep > 0 {
+		// find out how many spaces left of the Y axis
+		// to reserve for axis tick value by checking the string length
+		// of all values to be displayed
+		var lastVal string
+		valueLen := 0
+		if yScale == ScaleLog {
+			// a log axis labels round values where they fall,
+			// so measure the labels that will be drawn
+			for _, t := range yTicks(minY, maxY, gHeight, yStep, yFmter) {
+				if len(t.label) > valueLen {
+					valueLen = len(t.label)
+				}
+			}
+		} else {
+			rangeSz := maxY - minY // range of possible expected values
+			increment := rangeSz / float64(gHeight)
+			for i := 0; i <= gHeight; {
+				v := minY + (increment * float64(i)) // value to set left of Y axis
+				s := yFmter(i, v)
+				if lastVal != s {
+					if len(s) > valueLen {
+						valueLen = len(s)
+					}
+					lastVal = s
+				}
+				if i == gHeight {
+					break
+				}
+				i = min(i+yStep, gHeight)
+			}
+		}
+		origin.X += valueLen
+		gWidth -= (valueLen + 1) // ignore Y axis and tick values
+	}
+	return origin, gWidth, gHeight
+}
+
+// UpdateGraphSizes updates the Model origin, graph width and graph height.
+// This method is should be called whenever the X and Y axes values have changed,
+// for example when X and Y ranges have been adjusted by AutoAdjustRange().
+func (m *Model) UpdateGraphSizes() {
+	origin, gWidth, gHeight := getGraphSizeAndOrigin(
+		m.Canvas.Width(),
+		m.Canvas.Height(),
+		m.viewMinY,
+		m.viewMaxY,
+		m.xStep,
+		m.yStep,
+		m.yScale,
+		m.YLabelFormatter,
+	)
+	if m.y2Drawn() {
+		// reserve the right Y axis column and the widest right label
+		w := 0
+		for _, t := range m.y2Ticks(gHeight) {
+			w = max(w, len(t.label))
+		}
+		gWidth = max(0, gWidth-1-w)
+	}
+	m.origin = origin
+	m.graphWidth = gWidth
+	m.graphHeight = gHeight
+}
+
+// Width returns linechart width.
+func (m *Model) Width() int {
+	return m.Canvas.Width()
+}
+
+// Height returns linechart height.
+func (m *Model) Height() int {
+	return m.Canvas.Height()
+}
+
+// GraphWidth returns linechart graphing area width.
+func (m *Model) GraphWidth() int {
+	return m.graphWidth
+}
+
+// GraphHeight returns linechart graphing area height.
+func (m *Model) GraphHeight() int {
+	return m.graphHeight
+}
+
+// MinX returns linechart expected minimum X value.
+func (m *Model) MinX() float64 {
+	return m.minX
+}
+
+// MaxX returns linechart expected maximum X value.
+func (m *Model) MaxX() float64 {
+	return m.maxX
+}
+
+// MinY returns linechart expected minimum Y value.
+func (m *Model) MinY() float64 {
+	return m.minY
+}
+
+// MaxY returns linechart expected maximum Y value.
+func (m *Model) MaxY() float64 {
+	return m.maxY
+}
+
+// ViewMinX returns linechart displayed minimum X value.
+func (m *Model) ViewMinX() float64 {
+	return m.viewMinX
+}
+
+// ViewMaxX returns linechart displayed maximum X value.
+func (m *Model) ViewMaxX() float64 {
+	return m.viewMaxX
+}
+
+// ViewMinY returns linechart displayed minimum Y value.
+func (m *Model) ViewMinY() float64 {
+	return m.viewMinY
+}
+
+// ViewMaxY returns linechart displayed maximum Y value.
+func (m *Model) ViewMaxY() float64 {
+	return m.viewMaxY
+}
+
+// XStep returns number of steps when displaying Y axis values.
+func (m *Model) XStep() int {
+	return m.xStep
+}
+
+// XStep returns number of steps when displaying Y axis values.
+func (m *Model) YStep() int {
+	return m.yStep
+}
+
+// Origin returns a canvas Point with the coordinates
+// of the linechart graph (X,Y) origin.
+func (m *Model) Origin() canvas.Point {
+	return m.origin
+}
+
+// Clear will reset linechart canvas including axes and labels.
+func (m *Model) Clear() {
+	m.Canvas.Clear()
+}
+
+// SetXStep updates the number of steps when displaying X axis values.
+func (m *Model) SetXStep(xStep int) {
+	m.xStep = xStep
+	m.UpdateGraphSizes()
+}
+
+// SetYStep updates the number of steps when displaying Y axis values.
+func (m *Model) SetYStep(yStep int) {
+	m.yStep = yStep
+	m.UpdateGraphSizes()
+}
+
+// SetXRange updates the minimum and maximum expected X values.
+//
+// A log X axis (see SetXScale) cannot show a bound that is not greater than
+// zero, so such a range is sanitized: a non-positive minimum becomes one
+// decade below the maximum (max/10), a non-positive maximum one decade
+// above the minimum, and if neither bound is positive the range becomes
+// 1..10. The same applies to SetViewXRange.
+func (m *Model) SetXRange(min, max float64) {
+	min, max = m.xScale.sanitize(min, max)
+	m.minX = min
+	m.maxX = max
+}
+
+// SetYRange updates the minimum and maximum expected Y values.
+//
+// A log Y axis (see SetYScale) cannot show a bound that is not greater than
+// zero, so such a range is sanitized: a non-positive minimum becomes one
+// decade below the maximum (max/10), a non-positive maximum one decade
+// above the minimum, and if neither bound is positive the range becomes
+// 1..10. The same applies to SetViewYRange.
+//
+// The right Y axis's displayed range follows the left view within this
+// range (see Axis), so the layout is recomputed.
+func (m *Model) SetYRange(min, max float64) {
+	min, max = m.yScale.sanitize(min, max)
+	m.minY = min
+	m.maxY = max
+	m.UpdateGraphSizes()
+}
+
+// SetXYRange updates the minimum and maximum expected X and Y values.
+func (m *Model) SetXYRange(minX, maxX, minY, maxY float64) {
+	m.SetXRange(minX, maxX)
+	m.SetYRange(minY, maxY)
+}
+
+// SetXRange updates the displayed minimum and maximum X values.
+// Minimum and maximum values will be bounded by the expected X values.
+// Returns whether not displayed X values have updated.
+// On a log X axis the range is first sanitized as described on SetXRange.
+func (m *Model) SetViewXRange(min, max float64) bool {
+	min, max = m.xScale.sanitize(min, max)
+	vMin := math.Max(m.minX, min)
+	vMax := math.Min(m.maxX, max)
+	if vMin < vMax {
+		m.viewMinX = vMin
+		m.viewMaxX = vMax
+		m.UpdateGraphSizes()
+		return true
+	}
+	return false
+}
+
+// SetYRange updates the displayed minimum and maximum Y values.
+// Minimum and maximum values will be bounded by the expected Y values.
+// Returns whether not displayed Y values have updated.
+// On a log Y axis the range is first sanitized as described on SetYRange.
+func (m *Model) SetViewYRange(min, max float64) bool {
+	min, max = m.yScale.sanitize(min, max)
+	vMin := math.Max(m.minY, min)
+	vMax := math.Min(m.maxY, max)
+	if vMin < vMax {
+		m.viewMinY = vMin
+		m.viewMaxY = vMax
+		m.UpdateGraphSizes()
+		return true
+	}
+	return false
+}
+
+// SetViewXYRange updates the displayed minimum and maximum X and Y values.
+// Minimum and maximum values will be bounded by the expected values.
+func (m *Model) SetViewXYRange(minX, maxX, minY, maxY float64) {
+	m.SetViewXRange(minX, maxX)
+	m.SetViewYRange(minY, maxY)
+}
+
+// Resize will change linechart display width and height.
+// Existing runes on the linechart will not be redrawn.
+func (m *Model) Resize(w, h int) {
+	m.Canvas.Resize(w, h)
+	m.Canvas.ViewWidth = w
+	m.Canvas.ViewHeight = h
+	m.UpdateGraphSizes()
+}
+
+// AutoAdjustRange automatically adjusts both the expected X and Y values
+// and the displayed X and Y values if enabled and the given Float64Point
+// is outside of expected ranges.
+// It returns whether or not the display X and Y ranges have been adjusted.
+// With a right Y axis, widening the expected Y range counts as adjusting
+// the display, since the right axis's view follows the left range.
+// A point with a non-positive coordinate on a log axis has no place on the
+// chart and is ignored.
+func (m *Model) AutoAdjustRange(f canvas.Float64Point) (b bool) {
+	if !m.drawable(f) {
+		return false
+	}
+	// adjusts both expected range and
+	// the display range (if not zoomed in)
+	b = m.autoAdjustX(f.X)
+	minY, maxY := m.minY, m.maxY
+	if m.AutoMinY && (f.Y < m.minY) {
+		if m.minY == m.viewMinY {
+			m.viewMinY = f.Y
+			b = true
+		}
+		m.minY = f.Y
+	}
+	if m.AutoMaxY && (f.Y > m.maxY) {
+		if m.maxY == m.viewMaxY {
+			m.viewMaxY = f.Y
+			b = true
+		}
+		m.maxY = f.Y
+	}
+	if m.y2 != nil && (m.minY != minY || m.maxY != maxY) {
+		b = true
+	}
+	return
+}
+
+// autoAdjustX widens the expected X range to x if enabled, and the
+// displayed X range with it unless zoomed in. It reports whether the
+// displayed range changed.
+func (m *Model) autoAdjustX(x float64) (b bool) {
+	if m.AutoMinX && (x < m.minX) {
+		if m.minX == m.viewMinX {
+			m.viewMinX = x
+			b = true
+		}
+		m.minX = x
+	}
+	if m.AutoMaxX && (x > m.maxX) {
+		if m.maxX == m.viewMaxX {
+			m.viewMaxX = x
+			b = true
+		}
+		m.maxX = x
+	}
+	return
+}
+
+// SetZoneManager enables mouse functionality
+// by setting a bubblezone.Manager to the linechart.
+// The bubblezone.Manager can check bubbletea mouse event Msgs
+// passed to the UpdateHandler handler during an Update().
+// The root bubbletea model must wrap the View() string with
+// bubblezone.Manager.Scan() to enable mouse functionality.
+// To disable mouse functionality after enabling, call SetZoneManager on nil.
+func (m *Model) SetZoneManager(zm *zone.Manager) {
+	m.zoneManager = zm
+	if (zm != nil) && (m.zoneID == "") {
+		m.zoneID = zm.NewPrefix()
+	}
+}
+
+// ZoneManager will return linechart zone Manager.
+func (m *Model) ZoneManager() *zone.Manager {
+	return m.zoneManager
+}
+
+// ZoneID will return linechart zone ID used by zone Manager.
+func (m *Model) ZoneID() string {
+	return m.zoneID
+}
+
+// drawYLabel draws Y axis values left of the Y axis every n step.
+// Repeating values will be hidden.
+// Does nothing if n <= 0.
+func (m *Model) drawYLabel(n int) {
+	// from origin going up, draw data value left of the Y axis every n steps
+	// origin X coordinates already set such that there is space available
+	if n <= 0 {
+		return
+	}
+	if m.yScale == ScaleLog {
+		for _, t := range yTicks(m.viewMinY, m.viewMaxY, m.graphHeight, n, m.YLabelFormatter) {
+			m.Canvas.SetStringWithStyle(canvas.Point{X: m.origin.X - len(t.label), Y: m.origin.Y - t.pos}, t.label, m.LabelStyle)
+		}
+		return
+	}
+	var lastVal string
+	rangeSz := m.viewMaxY - m.viewMinY // range of possible expected values
+	increment := rangeSz / float64(m.graphHeight)
+	for i := 0; i <= m.graphHeight; {
+		v := m.viewMinY + (increment * float64(i)) // value to set left of Y axis
+		s := m.YLabelFormatter(i, v)
+		if lastVal != s {
+			m.Canvas.SetStringWithStyle(canvas.Point{X: m.origin.X - len(s), Y: m.origin.Y - i}, s, m.LabelStyle)
+			lastVal = s
+		}
+		if i == m.graphHeight {
+			break
+		}
+		i = min(i+n, m.graphHeight)
+	}
+}
+
+// drawXLabel draws X axis values below the X axis every n step.
+// Repeating values will be hidden.
+// Does nothing if n <= 0.
+func (m *Model) drawXLabel(n int) {
+	// from origin going right, draw data value left of the Y axis every n steps
+	if n <= 0 {
+		return
+	}
+	if m.xScale == ScaleLog {
+		m.drawXTicks(n)
+		return
+	}
+	var lastVal string
+	rangeSz := m.viewMaxX - m.viewMinX // range of possible expected values
+	increment := rangeSz / float64(m.graphWidth)
+	last := m.graphWidth - 1
+	for i := 0; i < m.graphWidth; {
+		// can only set if rune to the left of target coordinates is empty
+		if c := m.Canvas.Cell(canvas.Point{X: m.origin.X + i - 1, Y: m.origin.Y + 1}); c.Rune == runes.Null {
+			v := m.viewMinX + (increment * float64(i)) // value to set under X axis
+			if i == last {
+				// The per-column interpolation above is always exactly one
+				// increment short of viewMaxX — scalePoint plots the
+				// rightmost data point using graphWidth-1 as its
+				// denominator, one less than the denominator used for this
+				// per-column v — so using v here would understate the true
+				// axis maximum by one increment (a subtly wrong value, not
+				// just a spacing quirk) even when the label fits. Use the
+				// true axis-end value for the final tick instead, feeding
+				// both the left-anchored path below and the right-align
+				// fallback.
+				v = m.viewMaxX
+			}
+			s := m.XLabelFormatter(i, v)
+			// dont display if number will be cut off or value repeats
+			sLen := len(s) + m.origin.X + i
+			if (s != lastVal) && (sLen <= m.Canvas.Width()) {
+				m.Canvas.SetStringWithStyle(canvas.Point{X: m.origin.X + i, Y: m.origin.Y + 1}, s, m.LabelStyle)
+				lastVal = s
+			} else if i == last && s != lastVal {
+				// Final tick doesn't fit left-anchored: right-align it into
+				// remaining width if it does not overlap an earlier label.
+				if x := m.Canvas.Width() - len(s); x > m.origin.X {
+					clear := true
+					for col := x - 1; col < m.Canvas.Width(); col++ {
+						if m.Canvas.Cell(canvas.Point{X: col, Y: m.origin.Y + 1}).Rune != runes.Null {
+							clear = false
+							break
+						}
+					}
+					if clear {
+						m.Canvas.SetStringWithStyle(canvas.Point{X: x, Y: m.origin.Y + 1}, s, m.LabelStyle)
+						lastVal = s
+					}
+				}
+			}
+		}
+		if i == last {
+			break
+		}
+		i = min(i+n, last)
+	}
+}
+
+// yTicks returns the labels of a log Y axis showing min..max over
+// graphHeight rows, at least n rows apart.
+func yTicks(min, max float64, graphHeight, n int, fmter LabelFormatter) []tick {
+	min, max = ScaleLog.sanitize(min, max)
+	return logAxis{min: min, max: max, size: graphHeight, last: graphHeight, step: n, format: fmter}.ticks()
+}
+
+// drawXTicks draws the labels of a log X axis below it, at least n columns
+// apart, each on the column where its value falls. The collision and
+// final-label rules are those of drawXLabel.
+func (m *Model) drawXTicks(n int) {
+	var lastVal string
+	last := m.graphWidth - 1
+	axis := logAxis{min: m.viewMinX, max: m.viewMaxX, size: m.graphWidth, last: last, step: n, format: m.XLabelFormatter, labelCells: true}
+	for _, t := range axis.ticks() {
+		i, s := t.pos, t.label
+		// can only set if rune to the left of target coordinates is empty
+		if c := m.Canvas.Cell(canvas.Point{X: m.origin.X + i - 1, Y: m.origin.Y + 1}); c.Rune != runes.Null {
+			continue
+		}
+		// dont display if label will be cut off or repeats
+		if s == lastVal {
+			continue
+		}
+		if len(s)+m.origin.X+i <= m.Canvas.Width() {
+			m.Canvas.SetStringWithStyle(canvas.Point{X: m.origin.X + i, Y: m.origin.Y + 1}, s, m.LabelStyle)
+			lastVal = s
+		} else if i == last {
+			// Final tick doesn't fit left-anchored: right-align it into
+			// remaining width if it does not overlap an earlier label.
+			if x := m.Canvas.Width() - len(s); x > m.origin.X {
+				clear := true
+				for col := x - 1; col < m.Canvas.Width(); col++ {
+					if m.Canvas.Cell(canvas.Point{X: col, Y: m.origin.Y + 1}).Rune != runes.Null {
+						clear = false
+						break
+					}
+				}
+				if clear {
+					m.Canvas.SetStringWithStyle(canvas.Point{X: x, Y: m.origin.Y + 1}, s, m.LabelStyle)
+					lastVal = s
+				}
+			}
+		}
+	}
+}
+
+// DrawXYAxisAndLabel draws the X and Y axes, the right Y axis if any, and their labels.
+func (m *Model) DrawXYAxisAndLabel() {
+	drawY := m.yStep > 0
+	drawX := m.xStep > 0
+	if drawY && drawX {
+		graph.DrawXYAxis(&m.Canvas, m.origin, m.AxisStyle)
+	} else {
+		if drawY { // draw Y axis
+			graph.DrawVerticalLineUp(&m.Canvas, m.origin, m.AxisStyle)
+		}
+		if drawX { // draw X axis
+			graph.DrawHorizonalLineRight(&m.Canvas, m.origin, m.AxisStyle)
+		}
+	}
+	m.drawY2Axis()
+	m.drawYLabel(m.yStep)
+	m.drawY2Label()
+	m.drawXLabel(m.xStep)
+}
+
+// scalePoint returns a Float64Point scaled to the graph size
+// of the linechart from a Float64Point data point, width and height.
+// Distances are measured in scale space, so on a log axis equal ratios
+// are equal distances. A coordinate with no place on its axis scales to 0.
+func (m *Model) scalePoint(f canvas.Float64Point, w, h int) (r canvas.Float64Point) {
+	dx := m.xScale.span(m.viewMinX, m.viewMaxX)
+	dy := m.yScale.span(m.viewMinY, m.viewMaxY)
+	if dx > 0 && m.xScale.Valid(f.X) {
+		xs := float64(w) / dx
+		r.X = m.xScale.span(m.viewMinX, f.X) * xs
+	}
+	if dy > 0 && m.yScale.Valid(f.Y) {
+		ys := float64(h) / dy
+		r.Y = m.yScale.span(m.viewMinY, f.Y) * ys
+	}
+	return
+}
+
+// brailleGrid returns a BrailleGrid over the graphing area and the
+// expected X and Y ranges, in scale space; map data points onto it with
+// brailleGridPoint.
+func (m *Model) brailleGrid() *graph.BrailleGrid {
+	return graph.NewBrailleGrid(m.graphWidth, m.graphHeight,
+		m.xScale.forward(m.minX), m.xScale.forward(m.maxX),
+		m.yScale.forward(m.minY), m.yScale.forward(m.maxY))
+}
+
+// brailleGridPoint returns the braille grid point of a drawable data point.
+func (m *Model) brailleGridPoint(g *graph.BrailleGrid, f canvas.Float64Point) canvas.Point {
+	return g.GridPoint(canvas.Float64Point{X: m.xScale.forward(f.X), Y: m.yScale.forward(f.Y)})
+}
+
+// ScaleFloat64Point returns a Float64Point scaled to the graph size
+// of the linechart from a Float64Point data point.
+// A coordinate with no place on a log axis (see Scale.Valid) scales to 0.
+func (m *Model) ScaleFloat64Point(f canvas.Float64Point) (r canvas.Float64Point) {
+	// Need to use one less width and height, otherwise values rounded to the nearest
+	// integer would be would be between 0 to graph width/height,
+	// and indexing the full graph width/height would be outside of the canvas
+	return m.scalePoint(f, m.graphWidth-1, m.graphHeight-1)
+}
+
+// ScaleFloat64PointForLine returns a Float64Point scaled to the graph size
+// of the linechart from a Float64Point data point.  Used when drawing line runes
+// with line styles that can combine with the axes.
+// A coordinate with no place on a log axis (see Scale.Valid) scales to 0.
+func (m *Model) ScaleFloat64PointForLine(f canvas.Float64Point) (r canvas.Float64Point) {
+	// Full graph height and can be used since LineStyle runes
+	// can be combined with axes instead of overriding them
+	return m.scalePoint(f, m.graphWidth, m.graphHeight)
+}
+
+// DrawRune draws the rune on to the linechart
+// from a given Float64Point data point.
+func (m *Model) DrawRune(f canvas.Float64Point, r rune) {
+	m.DrawRuneWithStyle(f, r, m.Style)
+}
+
+// DrawRuneWithStyle draws the rune with style on to the linechart
+// from a given Float64Point data point.
+// On a log axis a point with a non-positive coordinate is not drawn, nor is
+// a line with such an endpoint; this holds for every Draw method.
+func (m *Model) DrawRuneWithStyle(f canvas.Float64Point, r rune, s lipgloss.Style) {
+	if !m.drawable(f) {
+		return
+	}
+	if m.AutoAdjustRange(f) { // auto adjust x and y ranges if enabled
+		m.UpdateGraphSizes()
+	}
+	sf := m.ScaleFloat64Point(f) // scale Cartesian coordinates data point to graphing area
+	p := canvas.CanvasPointFromFloat64Point(m.origin, sf)
+	// draw rune avoiding the axes
+	if m.yStep > 0 {
+		p.X++
+	}
+	if m.xStep > 0 {
+		p.Y--
+	}
+	if !m.inPlot(p) {
+		return
+	}
+	m.Canvas.SetCell(p, canvas.NewCellWithStyle(r, s))
+}
+
+// DrawRuneLine draws the rune on to the linechart
+// such that there is an approximate straight line between the two given
+// Float64Point data points.
+func (m *Model) DrawRuneLine(f1 canvas.Float64Point, f2 canvas.Float64Point, r rune) {
+	m.DrawRuneLineWithStyle(f1, f2, r, m.Style)
+}
+
+// DrawRuneLineWithStyle draws the rune with style on to the linechart
+// such that there is an approximate straight line between the two given
+// Float64Point data points.
+func (m *Model) DrawRuneLineWithStyle(f1 canvas.Float64Point, f2 canvas.Float64Point, r rune, s lipgloss.Style) {
+	if !m.drawable(f1) || !m.drawable(f2) {
+		return
+	}
+	// auto adjust x and y ranges if enabled
+	r1 := m.AutoAdjustRange(f1)
+	r2 := m.AutoAdjustRange(f2)
+	if r1 || r2 {
+		m.UpdateGraphSizes()
+	}
+
+	// scale Cartesian coordinates data point to graphing area
+	sf1 := m.ScaleFloat64Point(f1)
+	sf2 := m.ScaleFloat64Point(f2)
+
+	// convert scaled points to canvas points
+	p1 := canvas.CanvasPointFromFloat64Point(m.origin, sf1)
+	p2 := canvas.CanvasPointFromFloat64Point(m.origin, sf2)
+
+	// draw rune on all canvas coordinates between
+	// the two canvas points that approximates a line
+	points := graph.GetLinePointsWithLimit(p1, p2, m.MaxInterpolationPoints)
+	for _, p := range points {
+		if m.yStep > 0 {
+			p.X++
+		}
+		if m.xStep > 0 {
+			p.Y--
+		}
+		if !m.inPlot(p) {
+			continue
+		}
+		m.Canvas.SetCell(p, canvas.NewCellWithStyle(r, s))
+	}
+}
+
+// DrawRuneCircle draws the rune on to the linechart
+// such that there is an approximate circle of float64 radious around
+// the center of a circle at Float64Point data point.
+func (m *Model) DrawRuneCircle(c canvas.Float64Point, f float64, r rune) {
+	m.DrawRuneCircleWithStyle(c, f, r, m.Style)
+}
+
+// DrawRuneCircleWithStyle draws the rune with style on to the linechart
+// such that there is an approximate circle of float64 radious around
+// the center of a circle at Float64Point data point.
+func (m *Model) DrawRuneCircleWithStyle(c canvas.Float64Point, f float64, r rune, s lipgloss.Style) {
+	center := canvas.NewPointFromFloat64Point(c) // round center to nearest integers
+	radius := int(math.Round(f))                 // round radius to nearest integer
+
+	points := graph.GetCirclePointsWithLimit(center, radius, m.MaxInterpolationPoints)
+	for _, v := range points {
+		np := canvas.NewFloat64PointFromPoint(v)
+		// auto adjust x and y ranges if enabled
+		if m.AutoAdjustRange(np) {
+			m.UpdateGraphSizes()
+		}
+		if !m.drawable(np) {
+			continue
+		}
+		// scale Cartesian coordinates data point to graphing area
+		sf := m.ScaleFloat64Point(np)
+		// convert scaled points to canvas points
+		p := canvas.CanvasPointFromFloat64Point(m.origin, sf)
+		// draw rune while avoiding drawing outside of graphing area
+		// or on the X and Y axes
+		ok := (p.X >= m.origin.X) && (p.Y <= m.origin.Y) && m.inPlot(p)
+		if (m.yStep > 0) && (p.X == m.origin.X) {
+			ok = false
+		}
+		if (m.xStep > 0) && (p.Y == m.origin.Y) {
+			ok = false
+		}
+		if ok {
+			m.Canvas.SetCell(p, canvas.NewCellWithStyle(r, s))
+		}
+	}
+}
+
+// DrawLine draws line runes of a given LineStyle on to the linechart
+// such that there is an approximate straight line between the two given Float64Point data points.
+func (m *Model) DrawLine(f1 canvas.Float64Point, f2 canvas.Float64Point, ls runes.LineStyle) {
+	m.DrawLineWithStyle(f1, f2, ls, m.Style)
+}
+
+// DrawLineWithStyle draws line runes of a given LineStyle and style on to the linechart
+// such that there is an approximate straight line between the two given Float64Point data points.
+func (m *Model) DrawLineWithStyle(f1 canvas.Float64Point, f2 canvas.Float64Point, ls runes.LineStyle, s lipgloss.Style) {
+	if !m.drawable(f1) || !m.drawable(f2) {
+		return
+	}
+	// auto adjust x and y ranges if enabled
+	r1 := m.AutoAdjustRange(f1)
+	r2 := m.AutoAdjustRange(f2)
+	if r1 || r2 {
+		m.UpdateGraphSizes()
+	}
+
+	// scale Cartesian coordinates data points to graphing area
+	sf1 := m.ScaleFloat64PointForLine(f1)
+	sf2 := m.ScaleFloat64PointForLine(f2)
+
+	// convert scaled points to canvas points
+	p1 := canvas.CanvasPointFromFloat64Point(m.origin, sf1)
+	p2 := canvas.CanvasPointFromFloat64Point(m.origin, sf2)
+
+	// draw line runes on all canvas coordinates between
+	// the two canvas points that approximates a line
+	points := graph.GetLinePointsWithLimit(p1, p2, m.MaxInterpolationPoints)
+	if m.y2Drawn() {
+		// a straight line leaves the plot area at one end only, so the
+		// points kept stay contiguous
+		in := points[:0]
+		for _, p := range points {
+			if m.inPlot(p) {
+				in = append(in, p)
+			}
+		}
+		points = in
+	}
+	if len(points) <= 0 {
+		return
+	}
+	graph.DrawLinePoints(&m.Canvas, points, ls, s)
+}
+
+// DrawBrailleLine draws braille line runes of a given LineStyle on to the linechart
+// such that there is an approximate straight line between the two given Float64Point data points.
+// Braille runes will not overlap the axes.
+func (m *Model) DrawBrailleLine(f1 canvas.Float64Point, f2 canvas.Float64Point) {
+	m.DrawBrailleLineWithStyle(f1, f2, m.Style)
+}
+
+// DrawBrailleLineWithStyle draws braille line runes of a given LineStyle and style on to the linechart
+// such that there is an approximate straight line between the two given Float64Point data points.
+// Braille runes will not overlap the axes.
+func (m *Model) DrawBrailleLineWithStyle(f1 canvas.Float64Point, f2 canvas.Float64Point, s lipgloss.Style) {
+	if !m.drawable(f1) || !m.drawable(f2) {
+		return
+	}
+	// auto adjust x and y ranges if enabled
+	r1 := m.AutoAdjustRange(f1)
+	r2 := m.AutoAdjustRange(f2)
+	if r1 || r2 {
+		m.UpdateGraphSizes()
+	}
+
+	bGrid := m.brailleGrid()
+
+	// get braille grid points from two Float64Point data points
+	p1 := m.brailleGridPoint(bGrid, f1)
+	p2 := m.brailleGridPoint(bGrid, f2)
+
+	// set all points in the braille grid between two points that approximates a line
+	points := graph.GetLinePointsWithLimit(p1, p2, m.MaxInterpolationPoints)
+	for _, p := range points {
+		bGrid.Set(p)
+	}
+
+	// get all rune patterns for braille grid and draw them on to the canvas
+	startX := 0
+	if m.yStep > 0 {
+		startX = m.origin.X + 1
+	}
+	patterns := bGrid.BraillePatterns()
+	graph.DrawBraillePatterns(&m.Canvas, canvas.Point{X: startX, Y: 0}, patterns, s)
+}
+
+// DrawBrailleCircle draws braille line runes of a given LineStyle on to the linechart
+// such that there is an approximate circle of given float64 radius
+// around the center of a circle at Float64Point data point.
+// Braille runes will not overlap the axes.
+func (m *Model) DrawBrailleCircle(p canvas.Float64Point, f float64) {
+	m.DrawBrailleCircleWithStyle(p, f, m.Style)
+}
+
+// DrawBrailleCircleWithStyle draws braille line runes of a given LineStyle and style on to the linechart
+// such that there is an approximate circle of given float64 radius
+// around the center of a circle at Float64Point data point.
+// Braille runes will not overlap the axes.
+func (m *Model) DrawBrailleCircleWithStyle(c canvas.Float64Point, f float64, s lipgloss.Style) {
+	center := canvas.NewPointFromFloat64Point(c) // round center to nearest integer
+	radius := int(math.Round(f))                 // round radius to nearest integer
+
+	// set braille grid points from computed circle points around center
+	bGrid := m.brailleGrid()
+	points := graph.GetCirclePointsWithLimit(center, radius, m.MaxInterpolationPoints)
+	for _, p := range points {
+		np := canvas.NewFloat64PointFromPoint(p)
+		if !m.drawable(np) {
+			continue
+		}
+		if m.AutoAdjustRange(np) {
+			m.UpdateGraphSizes()
+		}
+		bGrid.Set(m.brailleGridPoint(bGrid, np))
+	}
+
+	// get all rune patterns for braille grid and draw them on to the canvas
+	startX := 0
+	if m.yStep > 0 {
+		startX = m.origin.X + 1
+	}
+	patterns := bGrid.BraillePatterns()
+	graph.DrawBraillePatterns(&m.Canvas, canvas.Point{X: startX, Y: 0}, patterns, s)
+}
+
+// Focused returns whether canvas is being focused.
+func (m *Model) Focused() bool {
+	return m.focus
+}
+
+// Focus enables Update events processing.
+func (m *Model) Focus() {
+	m.focus = true
+}
+
+// Blur disables Update events processing.
+func (m *Model) Blur() {
+	m.focus = false
+}
+
+// Init initializes the linechart.
+func (m Model) Init() tea.Cmd {
+	return m.Canvas.Init()
+}
+
+// Update processes bubbletea Msg to by invoking
+// UpdateHandlerFunc callback if linechart is focused.
+func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
+	if !m.focus {
+		return m, nil
+	}
+	m.UpdateHandler(&m, msg)
+	return m, nil
+}
+
+// View returns a string used by the bubbletea framework to display the linechart.
+func (m Model) View() (r string) {
+	r = m.Canvas.View()
+	if m.zoneManager != nil {
+		r = m.zoneManager.Mark(m.zoneID, r)
+	}
+	return
+}
